@@ -1,0 +1,540 @@
+import os
+import time
+import json
+import requests
+import numpy as np
+import pandas as pd
+import gspread
+from datetime import datetime
+from zoneinfo import ZoneInfo
+from dateutil.relativedelta import relativedelta
+from gspread_dataframe import set_with_dataframe
+from google.oauth2.service_account import Credentials
+from concurrent.futures import ThreadPoolExecutor
+
+# -------------------- START TIMER --------------------
+start_time = time.time()
+
+# -------------------- ENV & AUTH --------------------
+sec = os.getenv("ASHRITHA_SECRET_KEY")
+User_name = os.getenv("USERNAME")
+service_account_json = os.getenv("SERVICE_ACCOUNT_JSON")
+MB_URL = os.getenv("METABASE_URL").rstrip("/") + "/api/session"
+BATCH_METRICS_SHEET_KEY = os.getenv("BATCH_METRICS_SHEET_KEY")
+
+if not sec or not service_account_json:
+    raise ValueError("❌ Missing environment variables. Check GitHub secrets.")
+if not BATCH_METRICS_SHEET_KEY:
+    raise ValueError("❌ BATCH_METRICS_SHEET_KEY is not set. Check GitHub secrets.")
+
+# -------------------- GOOGLE AUTH --------------------
+service_info = json.loads(service_account_json)
+creds = Credentials.from_service_account_info(
+    service_info,
+    scopes=[
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive"
+    ]
+)
+gc = gspread.authorize(creds)
+
+# -------------------- METABASE AUTH --------------------
+res = requests.post(
+    MB_URL,
+    headers={"Content-Type": "application/json"},
+    json={"username": User_name, "password": sec}
+)
+res.raise_for_status()
+token = res.json()['id']
+METABASE_HEADERS = {
+    'Content-Type': 'application/json',
+    'X-Metabase-Session': token
+}
+print("✅ Metabase session created")
+
+SHEET_KEY = BATCH_METRICS_SHEET_KEY
+
+# -------------------- UTILITIES --------------------
+def mb_post(card_url):
+    """POST to a Metabase card URL and return the response."""
+    r = requests.post(card_url, headers=METABASE_HEADERS, timeout=120)
+    r.raise_for_status()
+    return r
+
+def write_sheet(sheet_key, worksheet_name, df):
+    """Clear and write a DataFrame to a Google Sheet."""
+    print(f"🔄 Updating sheet: {worksheet_name}")
+    for attempt in range(1, 6):
+        try:
+            sheet = gc.open_by_key(sheet_key)
+            ws = sheet.worksheet(worksheet_name)
+            ws.clear()
+            set_with_dataframe(ws, df, include_index=False, include_column_header=True)
+            print(f"✅ Successfully updated: {worksheet_name}")
+            return
+        except Exception as e:
+            print(f"[Sheets] Attempt {attempt} failed for {worksheet_name}: {e}")
+            if attempt < 5:
+                time.sleep(20)
+            else:
+                print(f"❌ All attempts failed for {worksheet_name}.")
+                raise
+
+def clean_to_int(series):
+    """Clean a series to integers, handling commas and floats."""
+    return pd.to_numeric(
+        series.astype(str)
+              .str.replace(',', '')
+              .str.replace(r'\.0$', '', regex=True)
+              .str.strip(),
+        errors='coerce'
+    ).fillna(0).astype(int)
+
+def fetch_enrolled_df():
+    """Fetch enrolled students from Metabase card 6289."""
+    r = mb_post('https://metabase-lierhfgoeiwhr.newtonschool.co/api/card/6289/query/json')
+    df_au = pd.DataFrame(r.json())
+    df_au = df_au[['user_id', 'label', 'au_batch_name']]
+    df_au = df_au[df_au['label'].isin(['Enrolled'])]
+    df_au['user_id'] = clean_to_int(df_au['user_id'])
+    df_au = df_au.rename(columns={'au_batch_name': 'admin_unit_name'})
+    return df_au
+
+# -------------------- SECTION 1: ASSIGNMENT --------------------
+def run_assignment():
+    print("\n📌 Running: Assignment")
+    r = mb_post('https://metabase-lierhfgoeiwhr.newtonschool.co/api/card/9136/query/json')
+    df = pd.DataFrame(r.json())
+    write_sheet(SHEET_KEY, "Assignment", df)
+
+# -------------------- SECTION 2: ATTENDANCE --------------------
+def run_attendance():
+    print("\n📌 Running: Attendance")
+    r = mb_post('https://metabase-lierhfgoeiwhr.newtonschool.co/api/card/9155/query/json')
+    df = pd.DataFrame(r.json())
+    write_sheet(SHEET_KEY, "Attendance", df)
+
+# -------------------- SECTION 3: TA --------------------
+def run_ta():
+    print("\n📌 Running: TA")
+    r = mb_post('https://metabase-lierhfgoeiwhr.newtonschool.co/api/card/9294/query/json')
+    df = pd.DataFrame(r.json())
+    write_sheet(SHEET_KEY, "TA", df)
+
+# -------------------- SECTION 4: LECTURE RATING --------------------
+def run_lecture_rating():
+    print("\n📌 Running: Lecture Rating")
+    r = mb_post('https://metabase-lierhfgoeiwhr.newtonschool.co/api/card/9298/query/json')
+    df = pd.DataFrame(r.json())
+    write_sheet(SHEET_KEY, "Lecture_Rating", df)
+
+# -------------------- SECTION 5: PLAYLIST --------------------
+def run_playlist():
+    print("\n📌 Running: Playlist")
+    r = mb_post('https://metabase-lierhfgoeiwhr.newtonschool.co/api/card/9292/query/json')
+    df = pd.DataFrame(r.json())
+    write_sheet(SHEET_KEY, "playlist", df)
+
+# -------------------- SECTION 6: PLACEMENT PHASE --------------------
+def run_placement_phase():
+    print("\n📌 Running: Placement Phase")
+
+    workbook = gc.open('Batch-wise-Metrics')
+    ws = workbook.worksheet('Prog<>Placement')
+    data = ws.get_all_values()
+    df = pd.DataFrame(data)
+    df.columns = df.iloc[0]
+    df = df.iloc[1:]
+
+    df['Enrolled Status'] = df['Enrolled Status'].astype(str).str.strip()
+    df['Phase'] = df['Phase'].astype(str).str.strip()
+
+    denominator_mask = (
+        df['Enrolled Status'].str.lower().isin(['currently enrolled', 'moonshot'])
+    ) & (
+        df['Phase'].str.lower() != 'unavailable'
+    ) & (
+        df['Phase'].str.lower() != 'debarred'
+    )
+    filtered_df = df[denominator_mask].copy()
+
+    recommended_mask = (filtered_df['Recommended date'].notna()) & \
+                       (filtered_df['Recommended date'].astype(str).str.strip() != "")
+    grooming_mask = (filtered_df['Grooming Pool (Picked)'].notna()) & \
+                    (filtered_df['Grooming Pool (Picked)'].astype(str).str.strip() != "")
+
+    placed_list = [
+        'Placed - NS + Self (with Testimonial)', 'Placed - Self (w/o testimonial)',
+        'Placed once; now returned', 'Placed - Self (w/o attribution)',
+        'Placed - NS (w/o testimonial)', 'Placed - Offer Reject',
+        'Placed - Unclean/Unaccountable'
+    ]
+    pr_list = ['Placement', 'Placement pause', 'PR']
+    demoted_list = ['Demoted']
+
+    placement_mask = filtered_df['Placed'].str.lower().isin([p.lower() for p in placed_list])
+    pr_mask = filtered_df['Phase'].str.lower().isin([p.lower() for p in pr_list]) + \
+              filtered_df['PR'].str.lower().isin([p.lower() for p in demoted_list])
+
+    batch_stats   = filtered_df.groupby('Batch').size().reset_index(name='Total_Eligible_#')
+    rec_counts    = filtered_df[recommended_mask].groupby('Batch').size().reset_index(name='Recommended_#')
+    gro_counts    = filtered_df[grooming_mask].groupby('Batch').size().reset_index(name='Grooming_#')
+    place_counts  = filtered_df[placement_mask].groupby('Batch').size().reset_index(name='Placement_#')
+    pr_counts     = filtered_df[pr_mask].groupby('Batch').size().reset_index(name='PR_#')
+
+    summary = pd.merge(batch_stats, rec_counts, on='Batch', how='left').fillna(0)
+    summary = pd.merge(summary, gro_counts, on='Batch', how='left').fillna(0)
+    summary = pd.merge(summary, place_counts, on='Batch', how='left').fillna(0)
+    summary = pd.merge(summary, pr_counts, on='Batch', how='left').fillna(0)
+
+    count_cols = ['Total_Eligible_#', 'Recommended_#', 'Grooming_#', 'Placement_#', 'PR_#']
+    summary[count_cols] = summary[count_cols].astype(int)
+
+    summary['Recommended_%'] = (summary['Recommended_#'] / summary['Total_Eligible_#'] * 100).round(2)
+    summary['Grooming_%']    = (summary['Grooming_#']    / summary['Total_Eligible_#'] * 100).round(2)
+    summary['Placement_%']   = (summary['Placement_#']   / summary['Total_Eligible_#'] * 100).round(2)
+    summary['PR_%']          = (summary['PR_#']          / summary['Total_Eligible_#'] * 100).round(2)
+
+    final_report = summary[[
+        'Batch', 'Total_Eligible_#',
+        'Recommended_#', 'Recommended_%',
+        'Grooming_#', 'Grooming_%',
+        'PR_#', 'PR_%',
+        'Placement_#', 'Placement_%'
+    ]]
+    write_sheet(SHEET_KEY, "Placement_Phase", final_report)
+
+# -------------------- SECTION 7: MODULE CONTEST ATTEMPT WISE --------------------
+def run_mc_attempt_wise():
+    print("\n📌 Running: Module Contest Attempt Wise")
+
+    workbook = gc.open('Placements')
+    ws = workbook.worksheet('MC_Raw_2')
+    data = ws.get_all_values()
+    df = pd.DataFrame(data)
+    df.columns = df.iloc[0]
+    df = df.iloc[1:]
+
+    df_au = fetch_enrolled_df()
+    df['user_id'] = clean_to_int(df['user_id'])
+    df = pd.merge(df, df_au, on=['user_id', 'admin_unit_name'], how='inner')
+
+    df['Total Score'] = pd.to_numeric(df['Total Score'].astype(str).str.replace(',', ''), errors='coerce').fillna(0)
+    df['contest_date'] = pd.to_datetime(df['contest_date'])
+
+    threshold = 64
+    df['is_cleared'] = df['Total Score'] >= threshold
+    df['scored_gt_1'] = df['Total Score'] > 1
+
+    batch_strength = df.groupby('admin_unit_name')['user_id'].nunique().reset_index()
+    batch_strength.columns = ['admin_unit_name', 'Batch_strength']
+
+    attempts_group = df.groupby(['admin_unit_name', 'module_name', 'contest_date']).agg(
+        total_entries=('user_id', 'count'),
+        scored_gt_1_count=('scored_gt_1', 'sum'),
+        cleared_count=('is_cleared', 'sum')
+    ).reset_index()
+
+    attempts_filtered = attempts_group[attempts_group['total_entries'] > 10].copy()
+    attempts_filtered = attempts_filtered.sort_values(['admin_unit_name', 'module_name', 'contest_date'])
+    attempts_filtered['Attempt_number'] = attempts_filtered.groupby(['admin_unit_name', 'module_name']).cumcount() + 1
+
+    final_df = pd.merge(attempts_filtered, batch_strength, on='admin_unit_name', how='left')
+    final_df['Attempt%']   = (final_df['scored_gt_1_count'] / final_df['Batch_strength'].replace(0, 1)) * 100
+    final_df['Clearance%'] = (final_df['cleared_count']     / final_df['Batch_strength'].replace(0, 1)) * 100
+
+    final_df = final_df.rename(columns={
+        'admin_unit_name': 'Admin_unit_name',
+        'module_name': 'Module_name',
+        'contest_date': 'Contest_date'
+    })
+
+    result_cols = ['Admin_unit_name', 'Batch_strength', 'Module_name', 'Attempt_number', 'Contest_date', 'Attempt%', 'Clearance%']
+    final_report = final_df[result_cols].copy()
+    final_report['Contest_date'] = final_report['Contest_date'].dt.strftime('%Y-%m-%d')
+    final_report['Attempt%']   = final_report['Attempt%'].round(2)
+    final_report['Clearance%'] = final_report['Clearance%'].round(2)
+
+    write_sheet(SHEET_KEY, "MC_Attempt_wise", final_report)
+
+# -------------------- SECTION 8: MID MODULE CONTEST ATTEMPT WISE --------------------
+def run_mid_mc_attempt_wise():
+    print("\n📌 Running: Mid Module Contest Attempt Wise")
+
+    workbook = gc.open('Placements')
+    ws = workbook.worksheet('Mid_MC_Raw')
+    data = ws.get_all_values()
+    df = pd.DataFrame(data)
+    df.columns = df.iloc[0]
+    df = df.iloc[1:]
+
+    df_au = fetch_enrolled_df()
+    df['user_id'] = clean_to_int(df['user_id'])
+    df = pd.merge(df, df_au, on=['user_id', 'admin_unit_name'], how='inner')
+
+    df['Total Score'] = pd.to_numeric(df['Total Score'].astype(str).str.replace(',', ''), errors='coerce').fillna(0)
+    df['contest_date'] = pd.to_datetime(df['contest_date'])
+
+    threshold = 64
+    df['is_cleared'] = df['Total Score'] >= threshold
+    df['scored_gt_1'] = df['Total Score'] > 1
+
+    batch_strength = df.groupby('admin_unit_name')['user_id'].nunique().reset_index()
+    batch_strength.columns = ['admin_unit_name', 'Batch_strength']
+
+    attempts_group = df.groupby(['admin_unit_name', 'module_name', 'contest_date']).agg(
+        total_entries=('user_id', 'count'),
+        scored_gt_1_count=('scored_gt_1', 'sum'),
+        cleared_count=('is_cleared', 'sum')
+    ).reset_index()
+
+    attempts_filtered = attempts_group[attempts_group['total_entries'] > 20].copy()
+    attempts_filtered = attempts_filtered.sort_values(['admin_unit_name', 'module_name', 'contest_date'])
+    attempts_filtered['Attempt_number'] = attempts_filtered.groupby(['admin_unit_name', 'module_name']).cumcount() + 1
+
+    final_df = pd.merge(attempts_filtered, batch_strength, on='admin_unit_name', how='left')
+    final_df['Attempt%']   = (final_df['scored_gt_1_count'] / final_df['Batch_strength'].replace(0, 1)) * 100
+    final_df['Clearance%'] = (final_df['cleared_count']     / final_df['Batch_strength'].replace(0, 1)) * 100
+
+    final_df = final_df.rename(columns={
+        'admin_unit_name': 'Admin_unit_name',
+        'module_name': 'Module_name',
+        'contest_date': 'Contest_date'
+    })
+
+    result_cols = ['Admin_unit_name', 'Batch_strength', 'Module_name', 'Attempt_number', 'Contest_date', 'Attempt%', 'Clearance%']
+    final_report = final_df[result_cols].copy()
+    final_report['Contest_date'] = final_report['Contest_date'].dt.strftime('%Y-%m-%d')
+    final_report['Attempt%']   = final_report['Attempt%'].round(2)
+    final_report['Clearance%'] = final_report['Clearance%'].round(2)
+
+    write_sheet(SHEET_KEY, "Mid_MC_Attempt_wise", final_report)
+
+# -------------------- SECTION 9: MODULE CONTEST OVERALL WISE --------------------
+def run_mc_overall_wise():
+    print("\n📌 Running: Module Contest Overall Wise")
+
+    workbook = gc.open('Placements')
+    ws = workbook.worksheet('MC_Raw_2')
+    data = ws.get_all_values()
+    df = pd.DataFrame(data)
+    df.columns = df.iloc[0]
+    df = df.iloc[1:]
+
+    df_au = fetch_enrolled_df()
+    df['user_id'] = clean_to_int(df['user_id'])
+    df = pd.merge(df, df_au, on=['user_id', 'admin_unit_name'], how='inner')
+
+    df['Total Score'] = pd.to_numeric(df['Total Score'].astype(str).str.replace(',', ''), errors='coerce').fillna(0)
+    df['contest_date'] = pd.to_datetime(df['contest_date'])
+
+    valid_contests = df.groupby(['admin_unit_name', 'module_name', 'contest_date']).size().reset_index(name='count')
+    valid_contests = valid_contests[valid_contests['count'] > 10]
+    df_valid = pd.merge(df, valid_contests[['admin_unit_name', 'module_name', 'contest_date']],
+                        on=['admin_unit_name', 'module_name', 'contest_date'])
+
+    batch_strength = df.groupby('admin_unit_name')['user_id'].nunique().reset_index()
+    batch_strength.columns = ['Admin_unit_name', 'Batch_strength']
+
+    threshold = 64
+    user_best_scores = df_valid.groupby(['admin_unit_name', 'module_name', 'user_id'])['Total Score'].max().reset_index()
+    user_best_scores['attempted'] = user_best_scores['Total Score'] > 1
+    user_best_scores['cleared']   = user_best_scores['Total Score'] >= threshold
+
+    overall_stats = user_best_scores.groupby(['admin_unit_name', 'module_name']).agg(
+        overall_attempt_count=('attempted', 'sum'),
+        overall_clearance_count=('cleared', 'sum')
+    ).reset_index()
+
+    final_df = pd.merge(overall_stats, batch_strength, left_on='admin_unit_name', right_on='Admin_unit_name')
+    final_df['Overall - Attempt%']   = (final_df['overall_attempt_count']   / final_df['Batch_strength']) * 100
+    final_df['Overall - Clearance%'] = (final_df['overall_clearance_count'] / final_df['Batch_strength']) * 100
+    final_df = final_df.rename(columns={'module_name': 'Module_name'})
+
+    result_cols = ['Admin_unit_name', 'Batch_strength', 'Module_name', 'Overall - Attempt%', 'Overall - Clearance%']
+    final_report = final_df[result_cols].copy()
+    final_report['Overall - Attempt%']   = final_report['Overall - Attempt%'].round(2)
+    final_report['Overall - Clearance%'] = final_report['Overall - Clearance%'].round(2)
+
+    write_sheet(SHEET_KEY, "MC_Overall_wise", final_report)
+
+# -------------------- SECTION 10: MID MODULE CONTEST OVERALL WISE --------------------
+def run_mid_mc_overall_wise():
+    print("\n📌 Running: Mid Module Contest Overall Wise")
+
+    workbook = gc.open('Placements')
+    ws = workbook.worksheet('Mid_MC_Raw')
+    data = ws.get_all_values()
+    df = pd.DataFrame(data)
+    df.columns = df.iloc[0]
+    df = df.iloc[1:]
+
+    df_au = fetch_enrolled_df()
+    df['user_id'] = clean_to_int(df['user_id'])
+    df = pd.merge(df, df_au, on=['user_id', 'admin_unit_name'], how='inner')
+
+    df['Total Score'] = pd.to_numeric(df['Total Score'].astype(str).str.replace(',', ''), errors='coerce').fillna(0)
+    df['contest_date'] = pd.to_datetime(df['contest_date'])
+
+    valid_contests = df.groupby(['admin_unit_name', 'module_name', 'contest_date']).size().reset_index(name='count')
+    valid_contests = valid_contests[valid_contests['count'] > 10]
+    df_valid = pd.merge(df, valid_contests[['admin_unit_name', 'module_name', 'contest_date']],
+                        on=['admin_unit_name', 'module_name', 'contest_date'])
+
+    batch_strength = df.groupby('admin_unit_name')['user_id'].nunique().reset_index()
+    batch_strength.columns = ['Admin_unit_name', 'Batch_strength']
+
+    threshold = 64
+    user_best_scores = df_valid.groupby(['admin_unit_name', 'module_name', 'user_id'])['Total Score'].max().reset_index()
+    user_best_scores['attempted'] = user_best_scores['Total Score'] > 1
+    user_best_scores['cleared']   = user_best_scores['Total Score'] >= threshold
+
+    overall_stats = user_best_scores.groupby(['admin_unit_name', 'module_name']).agg(
+        overall_attempt_count=('attempted', 'sum'),
+        overall_clearance_count=('cleared', 'sum')
+    ).reset_index()
+
+    final_df = pd.merge(overall_stats, batch_strength, left_on='admin_unit_name', right_on='Admin_unit_name')
+    final_df['Overall - Attempt%']   = (final_df['overall_attempt_count']   / final_df['Batch_strength']) * 100
+    final_df['Overall - Clearance%'] = (final_df['overall_clearance_count'] / final_df['Batch_strength']) * 100
+    final_df = final_df.rename(columns={'module_name': 'Module_name'})
+
+    result_cols = ['Admin_unit_name', 'Batch_strength', 'Module_name', 'Overall - Attempt%', 'Overall - Clearance%']
+    final_report = final_df[result_cols].copy()
+    final_report['Overall - Attempt%']   = final_report['Overall - Attempt%'].round(2)
+    final_report['Overall - Clearance%'] = final_report['Overall - Clearance%'].round(2)
+
+    write_sheet(SHEET_KEY, "Mid_MC_Overall_wise", final_report)
+
+# -------------------- SECTION 11: PROJECTS --------------------
+def parse_batch_date(batch_name):
+    if not isinstance(batch_name, str):
+        return pd.NaT
+    parts = batch_name.split()
+    for i in range(len(parts) - 1, 0, -1):
+        try:
+            month_abbr = parts[i-1][:3]
+            year = parts[i]
+            if len(year) == 4 and year.isdigit():
+                return datetime.strptime(f"{month_abbr} {year}", '%b %Y')
+        except:
+            continue
+    return pd.NaT
+
+def calculate_project_metrics_robust(df):
+    OVERALL_CUTOFF = datetime(2026, 1, 5)
+    df.columns = df.columns.str.strip()
+    df = df[df['label'] == 'Enrolled']
+    df = df[df['Module_name'].isin(['DS 02 Spreadsheets', 'DS 04 SQL', 'DS 03 Power BI'])]
+
+    df['marks_obtained']          = pd.to_numeric(df['marks_obtained'], errors='coerce')
+    df['project_release_date']    = pd.to_datetime(df['project_release_date'], errors='coerce')
+    df['Submission Time']         = pd.to_datetime(df['Submission Time'], errors='coerce')
+
+    metrics_list = []
+    for (au_batch_name, batch, module), group in df.groupby(['au_batch_name', 'Batch', 'Module_name']):
+        denominator = group['user_id'].nunique()
+        release_dt_raw = group['project_release_date'].min()
+        if pd.isna(release_dt_raw):
+            continue
+        release_date = release_dt_raw.date()
+
+        windows = {
+            'M0':  pd.to_datetime(release_date + relativedelta(days=30))  + pd.Timedelta(hours=23, minutes=59),
+            'M1':  pd.to_datetime(release_date + relativedelta(days=60))  + pd.Timedelta(hours=23, minutes=59),
+            'M2':  pd.to_datetime(release_date + relativedelta(days=90))  + pd.Timedelta(hours=23, minutes=59),
+            'MTD': OVERALL_CUTOFF
+        }
+
+        res = {
+            'au_batch_name': au_batch_name,
+            'batch': batch,
+            'Module': module,
+            'Release Date': release_date.strftime('%Y-%m-%d'),
+            'Enrolled Count': denominator
+        }
+
+        for label, cutoff in windows.items():
+            mask = (group['Submission Time'].notna()) & (group['Submission Time'] <= cutoff)
+            att_count = group[mask]['user_id'].nunique()
+            clr_count = group[mask & (group['marks_obtained'] >= 8)]['user_id'].nunique()
+            res[f'{label} Attempt %']   = f"{(att_count / denominator * 100):.1f}" if denominator > 0 else "0.0"
+            res[f'{label} Clearance %'] = f"{(clr_count / denominator * 100):.1f}" if denominator > 0 else "0.0"
+
+        metrics_list.append(res)
+
+    result_df = pd.DataFrame(metrics_list)
+    result_df['Sort_Key'] = result_df['batch'].apply(parse_batch_date)
+    result_df = result_df.sort_values(by=['Sort_Key', 'Module']).drop(columns=['Sort_Key'])
+
+    final_columns = [
+        'au_batch_name', 'batch', 'Module', 'Release Date', 'Enrolled Count',
+        'M0 Attempt %', 'M0 Clearance %',
+        'M1 Attempt %', 'M1 Clearance %',
+        'M2 Attempt %', 'M2 Clearance %',
+        'MTD Attempt %', 'MTD Clearance %'
+    ]
+    return result_df[final_columns]
+
+def run_projects():
+    print("\n📌 Running: Projects")
+
+    r1 = mb_post('https://metabase-lierhfgoeiwhr.newtonschool.co/api/card/6241/query/json')
+    r2 = mb_post('https://metabase-lierhfgoeiwhr.newtonschool.co/api/card/6242/query/json')
+    r3 = mb_post('https://metabase-lierhfgoeiwhr.newtonschool.co/api/card/6289/query/json')
+
+    df1 = pd.DataFrame(r1.json())
+    df2 = pd.DataFrame(r2.json())
+    df3 = pd.DataFrame(r3.json())[['user_id', 'au_batch_name', 'label']]
+
+    concatenated_df = pd.concat([df1, df2], axis=0, ignore_index=True)
+    concatenated_df = concatenated_df.rename(columns={'User ID': 'user_id'})
+
+    screened_df = pd.merge(concatenated_df, df3, on='user_id', how='left')
+    screened_df['Submission Time']          = pd.to_datetime(screened_df['Submission Time'])
+    screened_df['latest_feedback_given_time'] = pd.to_datetime(screened_df['latest_feedback_given_time'])
+    screened_df['project_deadline_date']    = pd.to_datetime(screened_df['project_deadline_date'])
+
+    # Write raw projects data
+    raw_sheet = gc.open_by_key('1e9BxI2N6ms1hh_OdfHgktntxi41_2Y2Jv5Oo-WnQDAo')
+    raw_ws = raw_sheet.worksheet("Projects")
+    raw_ws.clear()
+    set_with_dataframe(raw_ws, screened_df, include_index=False, include_column_header=True)
+    print("✅ Raw Projects sheet updated")
+
+    # Write metrics
+    projects_df = calculate_project_metrics_robust(screened_df)
+    write_sheet(SHEET_KEY, "Projects", projects_df)
+
+# -------------------- MAIN: RUN ALL --------------------
+if __name__ == "__main__":
+    print("🚀 Starting Batch Metrics Automation...")
+
+    tasks = [
+        ("Assignment",                  run_assignment),
+        ("Attendance",                  run_attendance),
+        ("TA",                          run_ta),
+        ("Lecture Rating",              run_lecture_rating),
+        ("Playlist",                    run_playlist),
+        ("Placement Phase",             run_placement_phase),
+        ("MC Attempt Wise",             run_mc_attempt_wise),
+        ("Mid MC Attempt Wise",         run_mid_mc_attempt_wise),
+        ("MC Overall Wise",             run_mc_overall_wise),
+        ("Mid MC Overall Wise",         run_mid_mc_overall_wise),
+        ("Projects",                    run_projects),
+    ]
+
+    for name, fn in tasks:
+        try:
+            fn()
+        except Exception as e:
+            print(f"❌ Error in {name}: {e}")
+
+    # -------------------- TIMESTAMP --------------------
+    current_time = datetime.now(ZoneInfo("Asia/Kolkata")).strftime("%d-%b-%Y %H:%M:%S")
+    print(f"\n✅ Timestamp: {current_time}")
+
+    end_time = time.time()
+    mins, secs = divmod(end_time - start_time, 60)
+    print(f"⏱ Total time: {int(mins)}m {int(secs)}s")
+    print("🎯 Batch Metrics Automation completed successfully!")
