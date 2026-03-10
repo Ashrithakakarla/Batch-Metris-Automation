@@ -422,7 +422,7 @@ def parse_batch_date(batch_name):
     return pd.NaT
 
 def calculate_project_metrics_robust(df):
-    OVERALL_CUTOFF = datetime(2026, 1, 5)
+    OVERALL_CUTOFF = datetime.now()
     df.columns = df.columns.str.strip()
     df = df[df['label'] == 'Enrolled']
     df = df[df['Module_name'].isin(['DS 02 Spreadsheets', 'DS 04 SQL', 'DS 03 Power BI'])]
