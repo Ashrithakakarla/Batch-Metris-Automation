@@ -94,10 +94,12 @@ def fetch_enrolled_df():
     """Fetch enrolled students from Metabase card 6289."""
     r = mb_post('https://metabase-lierhfgoeiwhr.newtonschool.co/api/card/6289/query/json')
     df_au = pd.DataFrame(r.json())
-    df_au = df_au[['user_id', 'label', 'au_batch_name']]
+    df_au = df_au[['user_id', 'label', 'au_batch_name', 'gem_label']]
     df_au = df_au[df_au['label'].isin(['Enrolled'])]
     df_au['user_id'] = clean_to_int(df_au['user_id'])
     df_au = df_au.rename(columns={'au_batch_name': 'admin_unit_name'})
+    # Fill null gem_label so it's never dropped from grouping downstream
+    df_au['gem_label'] = df_au['gem_label'].fillna('')
     return df_au
 
 # -------------------- SECTION 1: ASSIGNMENT --------------------
@@ -219,6 +221,9 @@ def run_mc_attempt_wise():
     df['user_id'] = clean_to_int(df['user_id'])
     df = pd.merge(df, df_au, on=['user_id', 'admin_unit_name'], how='inner')
 
+    # Fill null gem_label so it's never dropped from grouping downstream
+    df['gem_label'] = df['gem_label'].fillna('')
+
     df['Total Score'] = pd.to_numeric(df['Total Score'].astype(str).str.replace(',', ''), errors='coerce').fillna(0)
     df['contest_date'] = pd.to_datetime(df['contest_date'])
 
@@ -226,20 +231,21 @@ def run_mc_attempt_wise():
     df['is_cleared'] = df['Total Score'] >= threshold
     df['scored_gt_1'] = df['Total Score'] > 1
 
-    batch_strength = df.groupby('admin_unit_name')['user_id'].nunique().reset_index()
-    batch_strength.columns = ['admin_unit_name', 'Batch_strength']
+    # Batch strength split by gem_label too
+    batch_strength = df.groupby(['admin_unit_name', 'gem_label'])['user_id'].nunique().reset_index()
+    batch_strength.columns = ['admin_unit_name', 'gem_label', 'Batch_strength']
 
-    attempts_group = df.groupby(['admin_unit_name', 'module_name', 'contest_date']).agg(
+    attempts_group = df.groupby(['admin_unit_name', 'gem_label', 'module_name', 'contest_date']).agg(
         total_entries=('user_id', 'count'),
         scored_gt_1_count=('scored_gt_1', 'sum'),
         cleared_count=('is_cleared', 'sum')
     ).reset_index()
 
     attempts_filtered = attempts_group[attempts_group['total_entries'] > 10].copy()
-    attempts_filtered = attempts_filtered.sort_values(['admin_unit_name', 'module_name', 'contest_date'])
-    attempts_filtered['Attempt_number'] = attempts_filtered.groupby(['admin_unit_name', 'module_name']).cumcount() + 1
+    attempts_filtered = attempts_filtered.sort_values(['admin_unit_name', 'gem_label', 'module_name', 'contest_date'])
+    attempts_filtered['Attempt_number'] = attempts_filtered.groupby(['admin_unit_name', 'gem_label', 'module_name']).cumcount() + 1
 
-    final_df = pd.merge(attempts_filtered, batch_strength, on='admin_unit_name', how='left')
+    final_df = pd.merge(attempts_filtered, batch_strength, on=['admin_unit_name', 'gem_label'], how='left')
     final_df['Attempt%']   = (final_df['scored_gt_1_count'] / final_df['Batch_strength'].replace(0, 1)) * 100
     final_df['Clearance%'] = (final_df['cleared_count']     / final_df['Batch_strength'].replace(0, 1)) * 100
 
@@ -249,7 +255,7 @@ def run_mc_attempt_wise():
         'contest_date': 'Contest_date'
     })
 
-    result_cols = ['Admin_unit_name', 'Batch_strength', 'Module_name', 'Attempt_number', 'Contest_date', 'Attempt%', 'Clearance%']
+    result_cols = ['Admin_unit_name', 'gem_label', 'Batch_strength', 'Module_name', 'Attempt_number', 'Contest_date', 'Attempt%', 'Clearance%']
     final_report = final_df[result_cols].copy()
     final_report['Contest_date'] = final_report['Contest_date'].dt.strftime('%Y-%m-%d')
     final_report['Attempt%']   = final_report['Attempt%'].round(2)
@@ -325,6 +331,9 @@ def run_mc_overall_wise():
     df['user_id'] = clean_to_int(df['user_id'])
     df = pd.merge(df, df_au, on=['user_id', 'admin_unit_name'], how='inner')
 
+    # Fill null gem_label so it's never dropped from grouping downstream
+    df['gem_label'] = df['gem_label'].fillna('')
+
     df['Total Score'] = pd.to_numeric(df['Total Score'].astype(str).str.replace(',', ''), errors='coerce').fillna(0)
     df['contest_date'] = pd.to_datetime(df['contest_date'])
 
@@ -333,25 +342,30 @@ def run_mc_overall_wise():
     df_valid = pd.merge(df, valid_contests[['admin_unit_name', 'module_name', 'contest_date']],
                         on=['admin_unit_name', 'module_name', 'contest_date'])
 
-    batch_strength = df.groupby('admin_unit_name')['user_id'].nunique().reset_index()
-    batch_strength.columns = ['Admin_unit_name', 'Batch_strength']
+    # Batch strength split by gem_label too
+    batch_strength = df.groupby(['admin_unit_name', 'gem_label'])['user_id'].nunique().reset_index()
+    batch_strength.columns = ['Admin_unit_name', 'gem_label', 'Batch_strength']
 
     threshold = 64
-    user_best_scores = df_valid.groupby(['admin_unit_name', 'module_name', 'user_id'])['Total Score'].max().reset_index()
+    user_best_scores = df_valid.groupby(['admin_unit_name', 'gem_label', 'module_name', 'user_id'])['Total Score'].max().reset_index()
     user_best_scores['attempted'] = user_best_scores['Total Score'] > 1
     user_best_scores['cleared']   = user_best_scores['Total Score'] >= threshold
 
-    overall_stats = user_best_scores.groupby(['admin_unit_name', 'module_name']).agg(
+    overall_stats = user_best_scores.groupby(['admin_unit_name', 'gem_label', 'module_name']).agg(
         overall_attempt_count=('attempted', 'sum'),
         overall_clearance_count=('cleared', 'sum')
     ).reset_index()
 
-    final_df = pd.merge(overall_stats, batch_strength, left_on='admin_unit_name', right_on='Admin_unit_name')
+    final_df = pd.merge(
+        overall_stats, batch_strength,
+        left_on=['admin_unit_name', 'gem_label'],
+        right_on=['Admin_unit_name', 'gem_label']
+    )
     final_df['Overall - Attempt%']   = (final_df['overall_attempt_count']   / final_df['Batch_strength']) * 100
     final_df['Overall - Clearance%'] = (final_df['overall_clearance_count'] / final_df['Batch_strength']) * 100
     final_df = final_df.rename(columns={'module_name': 'Module_name'})
 
-    result_cols = ['Admin_unit_name', 'Batch_strength', 'Module_name', 'Overall - Attempt%', 'Overall - Clearance%']
+    result_cols = ['Admin_unit_name', 'gem_label', 'Batch_strength', 'Module_name', 'Overall - Attempt%', 'Overall - Clearance%']
     final_report = final_df[result_cols].copy()
     final_report['Overall - Attempt%']   = final_report['Overall - Attempt%'].round(2)
     final_report['Overall - Clearance%'] = final_report['Overall - Clearance%'].round(2)
@@ -373,6 +387,9 @@ def run_mid_mc_overall_wise():
     df['user_id'] = clean_to_int(df['user_id'])
     df = pd.merge(df, df_au, on=['user_id', 'admin_unit_name'], how='inner')
 
+    # Fill null gem_label so it's never dropped from grouping downstream
+    df['gem_label'] = df['gem_label'].fillna('')
+
     df['Total Score'] = pd.to_numeric(df['Total Score'].astype(str).str.replace(',', ''), errors='coerce').fillna(0)
     df['contest_date'] = pd.to_datetime(df['contest_date'])
 
@@ -381,25 +398,30 @@ def run_mid_mc_overall_wise():
     df_valid = pd.merge(df, valid_contests[['admin_unit_name', 'module_name', 'contest_date']],
                         on=['admin_unit_name', 'module_name', 'contest_date'])
 
-    batch_strength = df.groupby('admin_unit_name')['user_id'].nunique().reset_index()
-    batch_strength.columns = ['Admin_unit_name', 'Batch_strength']
+    # Batch strength split by gem_label too
+    batch_strength = df.groupby(['admin_unit_name', 'gem_label'])['user_id'].nunique().reset_index()
+    batch_strength.columns = ['Admin_unit_name', 'gem_label', 'Batch_strength']
 
     threshold = 64
-    user_best_scores = df_valid.groupby(['admin_unit_name', 'module_name', 'user_id'])['Total Score'].max().reset_index()
+    user_best_scores = df_valid.groupby(['admin_unit_name', 'gem_label', 'module_name', 'user_id'])['Total Score'].max().reset_index()
     user_best_scores['attempted'] = user_best_scores['Total Score'] > 1
     user_best_scores['cleared']   = user_best_scores['Total Score'] >= threshold
 
-    overall_stats = user_best_scores.groupby(['admin_unit_name', 'module_name']).agg(
+    overall_stats = user_best_scores.groupby(['admin_unit_name', 'gem_label', 'module_name']).agg(
         overall_attempt_count=('attempted', 'sum'),
         overall_clearance_count=('cleared', 'sum')
     ).reset_index()
 
-    final_df = pd.merge(overall_stats, batch_strength, left_on='admin_unit_name', right_on='Admin_unit_name')
+    final_df = pd.merge(
+        overall_stats, batch_strength,
+        left_on=['admin_unit_name', 'gem_label'],
+        right_on=['Admin_unit_name', 'gem_label']
+    )
     final_df['Overall - Attempt%']   = (final_df['overall_attempt_count']   / final_df['Batch_strength']) * 100
     final_df['Overall - Clearance%'] = (final_df['overall_clearance_count'] / final_df['Batch_strength']) * 100
     final_df = final_df.rename(columns={'module_name': 'Module_name'})
 
-    result_cols = ['Admin_unit_name', 'Batch_strength', 'Module_name', 'Overall - Attempt%', 'Overall - Clearance%']
+    result_cols = ['Admin_unit_name', 'gem_label', 'Batch_strength', 'Module_name', 'Overall - Attempt%', 'Overall - Clearance%']
     final_report = final_df[result_cols].copy()
     final_report['Overall - Attempt%']   = final_report['Overall - Attempt%'].round(2)
     final_report['Overall - Clearance%'] = final_report['Overall - Clearance%'].round(2)
